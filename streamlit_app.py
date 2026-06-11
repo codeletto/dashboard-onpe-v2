@@ -1,5 +1,6 @@
 import pandas as pd
 import streamlit as st
+import plotly.express as px
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -9,22 +10,30 @@ PROYECTO = "dashboard-onpe"
 UBICACION = "US"
 TABLA = "dashboard-onpe.ONPE_SEGUNDA_VUELTA.VOTOS"
 
+# Mapeo de candidato -> foto. La clave es una palabra que aparece en el nombre.
+FOTOS = {
+    "SANCHEZ": "img/roberto_sanchez.png",
+    "FUJIMORI": "img/keiko_fujimori.png",
+}
 
-# --- Conexión a BigQuery ---
-# En local lee el archivo credenciales.json; en la nube leerá los "secrets".
+
+def foto_de(nombre_candidato):
+    for clave, ruta in FOTOS.items():
+        if clave in nombre_candidato:
+            return ruta
+    return None
+
+
 @st.cache_resource
 def get_cliente():
-    # En la nube: lee credenciales desde los secrets de Streamlit.
-    # En local: usa el archivo credenciales.json.
-    if "gcp_service_account" in st.secrets:
-        credenciales = service_account.Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"]
-        )
-    else:
+    try:
+        info = dict(st.secrets["gcp_service_account"])
+        credenciales = service_account.Credentials.from_service_account_info(info)
+    except Exception:
         credenciales = service_account.Credentials.from_service_account_file("credenciales.json")
     return bigquery.Client(credentials=credenciales, project=PROYECTO, location=UBICACION)
 
-# --- Traer la ÚLTIMA foto de votos (la más reciente) ---
+
 @st.cache_data(ttl=60)
 def cargar_ultima():
     cliente = get_cliente()
@@ -33,20 +42,23 @@ def cargar_ultima():
         FROM `{TABLA}`
         WHERE fecha = (SELECT MAX(fecha) FROM `{TABLA}`)
     """
-    return cliente.query(consulta).result().to_dataframe()
+    df = cliente.query(consulta).result().to_dataframe()
+    df["fecha"] = pd.to_datetime(df["fecha"], utc=True).dt.tz_convert("America/Lima")
+    return df
 
 
-# --- Traer TODO el histórico (para la línea de tiempo) ---
 @st.cache_data(ttl=60)
 def cargar_historico():
     cliente = get_cliente()
     consulta = f"""
-        SELECT fecha, agrupacion, votos
+        SELECT fecha, agrupacion, votos, pct_validos
         FROM `{TABLA}`
         WHERE candidato != ''
         ORDER BY fecha
     """
-    return cliente.query(consulta).result().to_dataframe()
+    df = cliente.query(consulta).result().to_dataframe()
+    df["fecha"] = pd.to_datetime(df["fecha"], utc=True).dt.tz_convert("America/Lima")
+    return df
 
 
 st.title("🗳️ Segunda Vuelta Presidencial 2026")
@@ -58,9 +70,12 @@ if st.button("🔄 Actualizar datos"):
 df = cargar_ultima()
 candidatos = df[df["candidato"] != ""].sort_values("votos", ascending=False)
 
-# --- Tarjetas de cada candidato ---
+# --- Tarjetas de cada candidato (con foto) ---
 col1, col2 = st.columns(2)
 for col, (_, fila) in zip([col1, col2], candidatos.iterrows()):
+    ruta = foto_de(fila["candidato"])
+    if ruta:
+        col.image(ruta, width=130)
     col.metric(
         label=fila["agrupacion"],
         value=f"{fila['pct_validos']:.3f} %",
@@ -76,22 +91,57 @@ st.metric(
     value=f"{diferencia:,} votos",
 )
 
-# --- Gráfico de barras ---
+# --- Gráfico de barras horizontal (eje en 0, honesto) ---
 st.subheader("Votos válidos por candidato")
-st.bar_chart(candidatos, x="agrupacion", y="votos")
+fig = px.bar(
+    candidatos.sort_values("votos"),
+    x="votos",
+    y="agrupacion",
+    orientation="h",
+    text="votos",
+    color="agrupacion",
+)
+fig.update_traces(texttemplate="%{text:,}", textposition="auto")
+fig.update_layout(
+    showlegend=False,
+    xaxis_title="Votos",
+    yaxis_title="",
+    margin=dict(l=10, r=10, t=10, b=10),
+)
+st.plotly_chart(fig, width="stretch")
 
 # --- Detalle ---
 st.subheader("Detalle")
-st.dataframe(df, hide_index=True)
+df_display = df.copy()
+df_display["fecha"] = df_display["fecha"].dt.strftime("%d/%m/%Y %H:%M:%S")
+st.dataframe(df_display, hide_index=True, width="stretch")
 
-# --- Histórico desde BigQuery ---
-st.subheader("📈 Histórico de votos")
+# --- Histórico: evolución del PORCENTAJE (eje acercado, muestra la tendencia) ---
+st.subheader("📈 Evolución del % de votos válidos")
 historico = cargar_historico()
-if len(historico) > 0:
-    pivote = historico.pivot_table(
-        index="fecha", columns="agrupacion", values="votos", aggfunc="last"
+if historico["fecha"].nunique() > 1:
+    fig_hist = px.line(
+        historico,
+        x="fecha",
+        y="pct_validos",
+        color="agrupacion",
+        markers=True,
     )
-    st.line_chart(pivote)
-    st.dataframe(historico.sort_values("fecha", ascending=False), hide_index=True)
+    fig_hist.add_hline(
+        y=50, line_dash="dash", line_color="gray",
+        annotation_text="50%", annotation_position="top left",
+    )
+    fig_hist.update_layout(
+        yaxis_title="% votos válidos",
+        xaxis_title="",
+        legend_title="",
+        margin=dict(l=10, r=10, t=30, b=10),
+    )
+    st.plotly_chart(fig_hist, width="stretch")
+
+    hist_display = historico.sort_values("fecha", ascending=False).copy()
+    hist_display["fecha"] = hist_display["fecha"].dt.strftime("%d/%m/%Y %H:%M:%S")
+    st.dataframe(hist_display, hide_index=True, width="stretch")
 else:
-    st.info("Aún no hay suficientes registros para el histórico.")
+    st.info("Aún no hay suficientes tomas para el histórico. Espera a que el "
+            "programador de tareas registre más lecturas.")
