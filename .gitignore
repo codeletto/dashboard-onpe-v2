@@ -2,3 +2,4 @@ venv/
 credenciales.json
 __pycache__/
 data.json
+ingesta_log.txt
